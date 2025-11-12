@@ -7,7 +7,7 @@ use ollama_rs::generation::completion::GenerationResponse;
 use ollama_rs::generation::images::Image;
 use ollama_rs::Ollama;
 use tokio::sync::RwLock;
-use tracing::{debug, error};
+use tracing::error;
 use wasmcloud_provider_sdk::core::HostData;
 use wasmcloud_provider_sdk::{
     get_connection, load_host_data, run_provider, Context, LinkConfig, Provider,
@@ -24,7 +24,7 @@ const MODEL_NAME_KEY: &str = "model_name";
 const URL_KEY: &str = "url";
 
 impl Request {
-    fn into_generation_request(self, model: String) -> GenerationRequest {
+    fn into_generation_request(self, model: String) -> GenerationRequest<'static> {
         GenerationRequest::new(model, self.prompt).images(
             self.images
                 .unwrap_or_default()
@@ -37,22 +37,19 @@ impl Request {
 
 impl From<GenerationResponse> for Response {
     fn from(resp: GenerationResponse) -> Self {
-        let mut r = Response {
+        Response {
             model: resp.model,
             created_at: resp.created_at,
             response: resp.response,
             done: resp.done,
-            ..Default::default()
-        };
-        if let Some(data) = resp.final_data {
-            r.context = Some(data.context.0);
-            r.total_duration = Some(data.total_duration);
-            r.prompt_eval_count = Some(data.prompt_eval_count);
-            r.prompt_eval_duration = Some(data.prompt_eval_duration);
-            r.eval_count = Some(data.eval_count);
-            r.eval_duration = Some(data.eval_duration);
+            context: resp.context.map(|c| c.0),
+            total_duration: resp.total_duration,
+            load_duration: resp.load_duration,
+            prompt_eval_count: resp.prompt_eval_count.map(|v| v as u16),
+            prompt_eval_duration: resp.prompt_eval_duration,
+            eval_count: resp.eval_count.map(|v| v as u16),
+            eval_duration: resp.eval_duration,
         }
-        r
     }
 }
 
@@ -104,12 +101,15 @@ impl OllamaProvider {
             .await
             .context("failed to run provider")?;
         let connection = get_connection();
-        serve(
-            &connection.get_wrpc_client(connection.provider_key()),
-            provider,
-            shutdown,
-        )
-        .await
+        let wrpc_client = connection
+            .get_wrpc_client("ollama-provider")
+            .await
+            .context("failed to get wrpc client")?;
+        serve(&wrpc_client, provider)
+            .await
+            .context("failed to serve")?;
+        shutdown.await;
+        Ok(())
     }
 
     /// Build a [`OllamaProvider`] from [`HostData`]
@@ -162,15 +162,15 @@ impl Provider for OllamaProvider {
     }
 
     /// Handle notification that a link is dropped: close the connection which removes all subscriptions
-    async fn delete_link(&self, source_id: &str) -> anyhow::Result<()> {
-        self.components.write().await.remove(source_id);
+    // async fn delete_link(&self, source_id: &str) -> anyhow::Result<()> {
+    //     self.components.write().await.remove(source_id);
 
-        debug!(
-            component_id = %source_id,
-            "finished processing delete link for component",
-        );
-        Ok(())
-    }
+    //     debug!(
+    //         component_id = %source_id,
+    //         "finished processing delete link for component",
+    //     );
+    //     Ok(())
+    // }
 
     /// Handle shutdown request by closing all connections
     async fn shutdown(&self) -> anyhow::Result<()> {
